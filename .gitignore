@@ -1,0 +1,17 @@
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Streamlit
+.streamlit/
+
+# Outputs (local run artifacts)
+outputs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
