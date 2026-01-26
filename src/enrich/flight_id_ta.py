@@ -236,7 +236,9 @@ def assign_flight_ids_ta(
     # Segment index per candidate_key
     # New segment whenever break_reason != "" OR first row in group.
     is_new_seg = (df["flight_seg_break_reason"] != "") | df["_prev_ts"].isna()
-    df["flight_seg_idx"] = df.groupby("candidate_key")[is_new_seg].cumsum().astype(int) - 1
+    # pandas-safe: cumsum a real column (not a boolean mask)
+    df["_is_new_seg"] = is_new_seg.astype(int)
+    df["flight_seg_idx"] = df.groupby("candidate_key")["_is_new_seg"].cumsum().astype(int) - 1
     df.loc[df["flight_seg_idx"] < 0, "flight_seg_idx"] = 0
 
     # Segment start/end per (candidate_key, seg_idx)
@@ -303,8 +305,8 @@ def assign_flight_ids_ta(
 
     # Cleanup internal columns
     df = df.drop(
-        columns=["_prev_ts", "_prev_lat", "_prev_lon", "_seg_start_iso"],
-        errors="ignore",
+    columns=["_prev_ts", "_prev_lat", "_prev_lon", "_seg_start_iso", "_is_new_seg"],
+    errors="ignore",
     )
 
     return df

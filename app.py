@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import traceback
 from pathlib import Path
+import json
 
 from src.config import CONFIG
 from src.db.sql_guard import validate_select_only, ensure_limit
@@ -12,6 +13,7 @@ from src.db.query_builder import TaQueryParams, build_ta_sql, params_to_dict
 from src.logging_audit.run_manager import create_run, write_manifest, append_error
 from src.logging_audit.event_logger import EventLogger
 from src.enrich.candidate_key import ensure_candidate_key
+from src.enrich.flight_id_ta import assign_flight_ids_ta
 from src.enrich.profiling import add_profiling_columns
 from src.enrich.heartbeat_trigger import add_heartbeat_trigger
 from src.cache.session_cache import cache_get, cache_set, cache_clear
@@ -23,10 +25,56 @@ from src.export.filename_builder import build_export_name
 
 st.set_page_config(page_title="TA Analytics & QA Master Platform", layout="wide")
 
+def normalize_ta_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map common TA column variants -> required snake_case columns for enrichment.
+    Required by assign_flight_ids_ta:
+      - observation_timestamp, id, latitude, longitude
+    """
+    df = df.copy()
+
+    # build a lowercase lookup of existing columns
+    lower_map = {c.lower(): c for c in df.columns}
+
+    def _rename_if_present(target: str, candidates: list[str]) -> None:
+        for cand in candidates:
+            if cand.lower() in lower_map and target not in df.columns:
+                df.rename(columns={lower_map[cand.lower()]: target}, inplace=True)
+                break
+
+    # timestamps
+    _rename_if_present("observation_timestamp", [
+        "observation_timestamp",
+        "observationtime", "observation_time", "observationdatetime",
+        "timestamp", "time", "ts", "event_time",
+        "observation_timestamp_utc", "observation_time_utc"
+    ])
+
+    # id
+    _rename_if_present("id", [
+        "id", "observation_id", "row_id", "point_id", "track_id"
+    ])
+
+    # lat/lon
+    _rename_if_present("latitude", ["latitude", "lat", "y", "y_deg"])
+    _rename_if_present("longitude", ["longitude", "lon", "lng", "long", "x", "x_deg"])
+
+    # OPTIONAL: if altitude exists under different names, normalize it too
+    _rename_if_present("altitude", ["altitude", "alt", "alt_ft", "altitude_ft", "altitude_feet"])
+
+    return df
+
+
+
+
 def run_query(dsn: str, sql: str, params_manifest: dict | None, tab: str) -> pd.DataFrame:
     ctx = create_run(CONFIG.runs_dir)
     ev = EventLogger(ctx.events_path)
     ev.log("run_created", tab=tab, run_id=ctx.run_id)
+
+    st.session_state["last_run_dir"] = str(ctx.run_dir)
+    st.session_state["last_run_id"] = ctx.run_id
+    st.session_state["last_manifest_path"] = str(ctx.run_dir / "run_manifest.json")
 
     guard = validate_select_only(sql)
     if not guard.ok:
@@ -121,6 +169,9 @@ with tabs[0]:
     if st.button("Execute TA query", type="primary"):
         try:
             df = run_query(CONFIG.ta_dsn, sql_text, params_manifest=params_manifest, tab="tab1_ta")
+
+            df = normalize_ta_columns(df)
+
             cache_set("tab1_raw", df)
             st.success(f"Loaded {len(df):,} rows from TA.")
         except Exception as e:
@@ -136,12 +187,51 @@ with tabs[0]:
         # Assumes query returns snake_case columns:
         df_en = ensure_candidate_key(df_raw, col_name="candidate_key")
 
-        if "flight_id" not in df_en.columns:
-            st.warning("flight_id logic not wired yet. Paste TA flight_id logic into src/enrich/flight_id_ta.py")
+        #Load manifest from the run folder (so thersholds + audit apply)
 
-        if "flight_id" in df_en.columns:
+        manifest_path = st.session_state.get("last_manifest_path")
+        manifest = {}
+        if manifest_path and Path(manifest_path).exists():
+            try:
+                manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            except Exception:
+                manifest = {}
+
+        run_id = st.session_state.get("last_run_id")
+
+
+        #Flight_id enrichment (TA segmentation)
+
+        if "flight_id" not in df_en.columns:
+            try:
+                # This writes audit JSONL based on manifest["audit"] and thresholds under enrich.flight_id_ta.thresholds
+                required = ["candidate_key", "observation_timestamp", "id", "latitude", "longitude"]
+                missing = [c for c in required if c not in df_en.columns]
+                if missing:
+                    st.error(f"Missing columns for flight_id enrichment: {missing}")
+                    st.caption(f"Available columns: {list(df_en.columns)}")
+                    st.stop()
+                df_en = assign_flight_ids_ta(df_en, manifest=manifest, run_id=run_id)
+
+                # Log enrichment event in run events
+                try:
+                    # best-effort, don’t fail UI if logger path missing
+                    run_dir = Path(st.session_state.get("last_run_dir", ""))
+                    ev = EventLogger(run_dir / "events.jsonl")
+                    ev.log("enrich_flight_id_ta_finished", rows=len(df_en), flight_ids=int(df_en["flight_id"].notna().sum()))
+                except Exception:
+                    pass
+
+                st.success("flight_id assigned (TA segmentation).")
+            except Exception as e:
+                st.error(f"flight_id enrichment failed: {e}")
+                st.stop()
+
+        if "flight_id" in df_en.columns and df_en["flight_id"].notna().any():
             df_en = add_profiling_columns(df_en, group_key="flight_id")
             df_en = add_heartbeat_trigger(df_en, group_key="flight_id")
+        else:
+            st.warning("No non-null flight_id values produced (check thresholds / small segments).")
 
         cache_set("tab1_enriched", df_en)
 
