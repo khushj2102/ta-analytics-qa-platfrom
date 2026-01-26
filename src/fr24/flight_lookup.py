@@ -1,11 +1,11 @@
 from __future__ import annotations
 import pandas as pd
 from typing import Tuple, List, Dict
-from ..db.odbc import conncect_odbc, execute_sql_df
+from ..db.odbc import connect_odbc, execute_sql_df
 from .sql_templates import build_positions_flights_lookup_sql
 
 def fetch_fr24_flight_ids(df_ref: pd.DataFrame, dsn_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    conn = conncect_odbc(dsn_name)
+    conn = connect_odbc(dsn_name)
     results: List[pd.DataFrame] = []
     errors: List[Dict] = []
     

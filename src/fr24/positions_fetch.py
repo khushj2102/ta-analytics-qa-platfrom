@@ -1,7 +1,7 @@
 from __future__ import annotations
 import pandas as pd
 from typing import Tuple, List, Dict
-from ..db.odbc import conncect_odbc, execute_sql_df
+from ..db.odbc import connect_odbc, execute_sql_df
 from .sql_templates import build_positions_sql
 
 def fetch_fr24_positions(df_flight_ids: pd.DataFrame, dsn_name: str, batch_size: int = 100)-> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -10,7 +10,7 @@ def fetch_fr24_positions(df_flight_ids: pd.DataFrame, dsn_name: str, batch_size:
     if missing:
         raise ValueError(f"df_flight_ids missing columns: {missing}")
     
-    conn = conncect_odbc(dsn_name)
+    conn = connect_odbc(dsn_name)
     results: List[pd.DataFrame] = []
     errors: List[Dict] = []
 

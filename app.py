@@ -23,6 +23,14 @@ from src.viz.timeline_plotly import build_timeline
 from src.export.export_manager import export_csv
 from src.export.filename_builder import build_export_name
 
+from src.fr24.airport_mapping import load_airport_mapping, map_icao_to_iata
+from src.fr24.flight_lookup import fetch_fr24_flight_ids
+from src.fr24.positions_fetch import fetch_fr24_positions
+
+from dtale.app import get_instance
+import dtale
+
+
 st.set_page_config(page_title="TA Analytics & QA Master Platform", layout="wide")
 
 def normalize_ta_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -65,6 +73,51 @@ def normalize_ta_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def build_run_manifest(
+    ctx,
+    *,
+    tab: str,
+    dsn: str,
+    status: str,
+    sql: str,
+    params: dict,
+    extra: dict | None = None,
+) -> dict:
+    """Standardize run_manifest.json structure and ensure audit/enrich defaults exist.
+
+    - Puts audit output inside the run folder by default (run_dir/audit)
+    - Provides default thresholds for flight_id_ta that can be overridden later
+    """
+    base = {
+        "run_id": ctx.run_id,
+        "tab": tab,
+        "dsn": dsn,
+        "status": status,
+        "sql": sql,
+        "params": params or {},
+        "audit": {
+            "enabled": True,
+            "dir": str((ctx.run_dir / "audit").resolve()),
+        },
+        "enrich": {
+            "flight_id_ta": {
+                "enabled": True,
+                "thresholds": {
+                    "max_time_gap_s": 1800,
+                    "max_distance_km": 150.0,
+                    "max_speed_kmh": 1300.0,
+                    "min_points_per_flight": 10,
+                    "drop_small_segments": False,
+                },
+            }
+        },
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+
 
 
 def run_query(dsn: str, sql: str, params_manifest: dict | None, tab: str) -> pd.DataFrame:
@@ -74,11 +127,11 @@ def run_query(dsn: str, sql: str, params_manifest: dict | None, tab: str) -> pd.
 
     st.session_state["last_run_dir"] = str(ctx.run_dir)
     st.session_state["last_run_id"] = ctx.run_id
-    st.session_state["last_manifest_path"] = str(ctx.run_dir / "run_manifest.json")
+    st.session_state["last_manifest_path"] = str(ctx.manifest_path)
 
     guard = validate_select_only(sql)
     if not guard.ok:
-        write_manifest(ctx, {"tab": tab, "dsn": dsn, "status": "blocked", "message": guard.message, "sql": sql, "params": params_manifest or {}})
+        write_manifest(ctx, build_run_manifest(ctx, tab=tab, dsn=dsn, status="blocked", sql=sql, params=params_manifest or {}, extra={"message": guard.message}))
         raise ValueError(guard.message)
 
     sql2, eff_limit, appended = ensure_limit(guard.sql, CONFIG.default_auto_limit, CONFIG.hard_max_rows)
@@ -93,23 +146,18 @@ def run_query(dsn: str, sql: str, params_manifest: dict | None, tab: str) -> pd.
     except Exception as e:
         tb = traceback.format_exc()
         append_error(ctx, tb)
-        write_manifest(ctx, {"tab": tab, "dsn": dsn, "status": "error", "sql": sql2, "params": params_manifest or {}, "error": str(e)})
+        write_manifest(ctx, build_run_manifest(ctx, tab=tab, dsn=dsn, status="error", sql=sql2, params=params_manifest or {}, extra={"error": str(e)}))
         raise
 
     if len(df) > CONFIG.hard_max_rows:
         df = df.iloc[: CONFIG.hard_max_rows].copy()
 
-    write_manifest(ctx, {
-        "tab": tab,
-        "dsn": dsn,
-        "status": "ok",
-        "sql": sql2,
-        "params": params_manifest or {},
+    write_manifest(ctx, build_run_manifest(ctx, tab=tab, dsn=dsn, status="ok", sql=sql2, params=params_manifest or {}, extra={
         "rows": int(len(df)),
         "columns": list(df.columns),
         "hard_max_rows": CONFIG.hard_max_rows,
         "default_auto_limit": CONFIG.default_auto_limit,
-    })
+    }))
 
     try:
         save_parquet(df, ctx.cache_dir / f"{tab}_raw.parquet")
@@ -295,19 +343,179 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("TA vs FR24 (visual overlay)")
-    st.info("FR24 wiring will be completed after TA flight_id logic is pasted. Modules live under src/fr24/.")
+
+    df_en = cache_get("tab1_enriched")
+    if not isinstance(df_en, pd.DataFrame) or df_en.empty:
+        st.info("Run Tab 1 first to generate enriched TA data with flight_id.")
+    else:
+        # Pick flights to compare
+        if "flight_id" not in df_en.columns:
+            st.warning("flight_id is missing in Tab 1 enriched data.")
+        else:
+            flight_ids = sorted(df_en["flight_id"].dropna().unique().tolist())
+            if not flight_ids:
+                st.warning("No flight_id values available to compare.")
+            else:
+                selected_flights = st.multiselect(
+                    "Select TA flight_id(s) to fetch FR24 for",
+                    options=flight_ids,
+                    default=flight_ids[: min(3, len(flight_ids))],
+                    key="tab2_flights",
+                )
+                if not selected_flights:
+                    st.caption("Select at least one flight_id to continue.")
+                else:
+                    # Build reference rows for FR24 lookup
+                    df_ref = (
+                        df_en[df_en["flight_id"].isin(selected_flights)]
+                        .groupby("flight_id", as_index=False)
+                        .agg({
+                            "observation_timestamp": "min",
+                            "registration": "first" if "registration" in df_en.columns else "size",
+                            "departure_aerodome": "first" if "departure_aerodome" in df_en.columns else "size",
+                            "destination_aerodome": "first" if "destination_aerodome" in df_en.columns else "size",
+                        })
+                    )
+
+                    # Clean up placeholders if missing columns existed
+                    if "registration" not in df_en.columns:
+                        df_ref["registration"] = ""
+                    if "departure_aerodome" not in df_en.columns:
+                        df_ref["departure_aerodome"] = ""
+                    if "destination_aerodome" not in df_en.columns:
+                        df_ref["destination_aerodome"] = ""
+
+                    df_ref = df_ref.reset_index(drop=True)
+                    df_ref["query_index"] = df_ref.index.astype(int)
+                    df_ref["date_part_str"] = pd.to_datetime(df_ref["observation_timestamp"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
+
+                    # Map ICAO->IATA using your airport dataset
+                    try:
+                        mapping = load_airport_mapping(CONFIG.airport_mapping_csv)
+                        df_ref = map_icao_to_iata(df_ref, mapping)
+                    except Exception as e:
+                        st.warning(f"Airport mapping failed (dep/arr IATA may be blank): {e}")
+                        df_ref["dep_iata"] = df_ref.get("dep_iata", "")
+                        df_ref["arr_iata"] = df_ref.get("arr_iata", "")
+
+                    st.subheader("FR24 lookup inputs")
+                    st.dataframe(df_ref[["flight_id", "registration", "departure_aerodome", "destination_aerodome", "dep_iata", "arr_iata", "date_part_str", "query_index"]], use_container_width=True)
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        do_fetch = st.button("Fetch FR24 (flight_ids + positions)", type="primary")
+                    with col_b:
+                        batch_size = st.number_input("FR24 positions batch size", min_value=10, max_value=500, value=100, step=10)
+
+                    if do_fetch:
+                        # Step 1: lookup positions_flights
+                        with st.spinner("Looking up FR24 flight_ids..."):
+                            df_ids_raw, df_ids_err = fetch_fr24_flight_ids(df_ref, CONFIG.fr24_dsn)
+
+                        if not df_ids_raw.empty:
+                            # Normalize column name
+                            if "FLIGHT_ID" in df_ids_raw.columns and "fr24_flight_id" not in df_ids_raw.columns:
+                                df_ids_raw = df_ids_raw.rename(columns={"FLIGHT_ID": "fr24_flight_id"})
+                            st.success(f"FR24 flight_id matches: {len(df_ids_raw):,}")
+                        else:
+                            st.warning("No FR24 flight_id matches returned.")
+
+                        if df_ids_err is not None and not df_ids_err.empty:
+                            st.warning(f"FR24 lookup issues: {len(df_ids_err):,}")
+                            st.dataframe(df_ids_err.head(50), use_container_width=True)
+
+                        cache_set("tab2_fr24_flight_ids", df_ids_raw)
+
+                        # Step 2: fetch positions
+                        if df_ids_raw is not None and not df_ids_raw.empty and "fr24_flight_id" in df_ids_raw.columns:
+                            # Ensure required columns exist for positions fetch
+                            df_ids_raw = df_ids_raw.merge(
+                                df_ref[["query_index", "date_part_str"]],
+                                on="query_index",
+                                how="left",
+                            )
+
+                            with st.spinner("Fetching FR24 positions..."):
+                                df_pos, df_pos_err = fetch_fr24_positions(df_ids_raw[["fr24_flight_id", "date_part_str", "query_index"]], CONFIG.fr24_dsn, batch_size=int(batch_size))
+
+                            cache_set("tab2_fr24_positions", df_pos)
+                            if df_pos is not None and not df_pos.empty:
+                                st.success(f"FR24 positions: {len(df_pos):,} rows")
+                            else:
+                                st.warning("No FR24 positions returned.")
+
+                            if df_pos_err is not None and not df_pos_err.empty:
+                                st.warning(f"FR24 positions fetch errors: {len(df_pos_err):,}")
+                                st.dataframe(df_pos_err.head(50), use_container_width=True)
+
+                    # Visual overlay (if we already have FR24 positions cached)
+                    df_pos = cache_get("tab2_fr24_positions")
+                    if isinstance(df_pos, pd.DataFrame) and not df_pos.empty:
+                        st.divider()
+                        st.subheader("Overlay map (TA vs FR24)")
+
+                        # Build a combined plotting frame with common lat/lon and source label
+                        ta_plot = df_en[df_en["flight_id"].isin(selected_flights)].copy()
+                        ta_plot["source"] = "TA"
+                        ta_plot = ta_plot.rename(columns={"latitude": "lat", "longitude": "lon"})
+                        fr24_plot = df_pos.copy()
+                        # best-effort normalize FR24 cols
+                        if "fr24_latitude" in fr24_plot.columns:
+                            fr24_plot = fr24_plot.rename(columns={"fr24_latitude": "lat", "fr24_longitude": "lon"})
+                        fr24_plot["source"] = "FR24"
+
+                        # keep only rows with lat/lon
+                        plot_df = pd.concat(
+                            [
+                                ta_plot[[c for c in ["lat", "lon", "flight_id", "source", "observation_timestamp"] if c in ta_plot.columns]],
+                                fr24_plot[[c for c in ["lat", "lon", "fr24_flight_id", "source", "fr24_obs_timestamp"] if c in fr24_plot.columns]].rename(columns={"fr24_flight_id": "flight_id", "fr24_obs_timestamp": "observation_timestamp"}),
+                            ],
+                            ignore_index=True,
+                            sort=False,
+                        ).dropna(subset=["lat", "lon"])
+
+                        fig_map = build_map_figure(
+                            plot_df.rename(columns={"lat": "latitude", "lon": "longitude"}),
+                            lat_col="latitude",
+                            lon_col="longitude",
+                            color_col="source",
+                            hover_cols=[c for c in ["source", "flight_id", "observation_timestamp"] if c in plot_df.columns],
+                            show_points=True,
+                            show_lines=True,
+                        )
+                        st.plotly_chart(fig_map, use_container_width=True)
 
 with tabs[2]:
     st.subheader("TA EDA (D-Tale)")
+
     sql3 = st.text_area("SQL (SELECT-only)", height=200, key="tab3_sql")
     if st.button("Execute TA query (EDA)"):
         try:
             df3 = run_query(CONFIG.ta_dsn, sql3, params_manifest={}, tab="tab3_eda")
+            df3 = normalize_ta_columns(df3)
             cache_set("tab3_raw", df3)
             st.success(f"Loaded {len(df3):,} rows.")
+
+            # Start / reuse a D-Tale instance and provide a link
+            try:
+                inst = dtale.show(df3, open_browser=False, name=f"tab3_{st.session_state.get('last_run_id','run')}")
+                url = inst._main_url  # e.g. http://localhost:40000/dtale/main/1
+                st.session_state["tab3_dtale_url"] = url
+            except Exception as e:
+                st.warning(f"Could not start D-Tale: {e}")
+
         except Exception as e:
             st.error(str(e))
             if st.session_state.get("last_run_dir"):
                 st.caption(f"Run folder: {st.session_state['last_run_dir']}")
 
-    st.warning("D-Tale open-new-tab integration to be added next.")
+    df3 = cache_get("tab3_raw")
+    if isinstance(df3, pd.DataFrame) and not df3.empty:
+        st.subheader("Preview")
+        st.dataframe(df3.head(25), use_container_width=True)
+
+        url = st.session_state.get("tab3_dtale_url")
+        if url:
+            st.markdown(f"✅ **D-Tale is running:** [Open D-Tale in a new tab]({url})")
+        else:
+            st.caption("Run the EDA query to launch D-Tale and get a link.")
