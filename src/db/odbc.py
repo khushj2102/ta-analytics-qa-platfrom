@@ -3,7 +3,7 @@ import pyodbc
 import pandas as pd
 from typing import Optional
 
-def conncect_odbc(dsn_name: str)-> pyodbc.Connection:
+def connect_odbc(dsn_name: str)-> pyodbc.Connection:
     return pyodbc.connect(f"DSN={dsn_name};", autocommit=True)
 
 def execute_sql_df(sql: str, conn: pyodbc.Connection, cursor_timeout: Optional[int] = None)-> pd.DataFrame:
